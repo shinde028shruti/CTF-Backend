@@ -1,0 +1,21 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Local data
+db.sqlite3
+db.sqlite3.*
+media/
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
