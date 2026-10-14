@@ -22,4 +22,11 @@ from django.urls import include, path
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/', include('users.urls')),
+    # Public challenge + category endpoints: /api/v1/challenges/, /categories/.
+    path('api/v1/', include('challenges.urls')),
+    # Flag submission: POST /api/v1/challenges/{id}/submit/.
+    path('api/v1/', include('submissions.urls')),
+    # Admin challenge endpoints share the /api/v1/admin/ prefix with users.
+    path('api/v1/admin/', include('users.admin_urls')),
+    path('api/v1/admin/', include('challenges.admin_urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

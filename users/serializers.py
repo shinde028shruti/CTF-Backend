@@ -1,7 +1,10 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from rest_framework import serializers
+
+from .groups import assign_default_group
 
 User = get_user_model()
 
@@ -29,6 +32,16 @@ class UserSerializer(serializers.ModelSerializer):
             'onboarding',
         )
         read_only_fields = fields
+
+    def to_representation(self, instance):
+        # Report app-admin for a stored role of 'admin' or for a Django
+        # superuser, so the frontend's `user.role === 'admin'` gate unlocks for
+        # both. Read-time only: the stored `role` column is never changed, and
+        # group membership is not consulted (role and groups stay independent).
+        data = super().to_representation(instance)
+        if instance.is_admin:
+            data['role'] = User.ROLE_ADMIN
+        return data
 
 
 class OnboardingSerializer(serializers.Serializer):
@@ -88,7 +101,10 @@ class RegisterSerializer(serializers.ModelSerializer):
         fields = ('username', 'email', 'password', 'password2')
 
     def validate_username(self, value):
-        if User.objects.filter(username__iexact=value).exists():
+        # all_objects: a soft-deleted account still occupies its (UNIQUE)
+        # username, so rejecting only against `objects` would let validation
+        # pass and then blow up with a DB IntegrityError.
+        if User.all_objects.filter(username__iexact=value).exists():
             raise serializers.ValidationError('A user with that username already exists.')
         return value
 
@@ -115,7 +131,14 @@ class RegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # create_user() hashes the password via set_password().
         validated_data.pop('password2')
-        return User.objects.create_user(**validated_data)
+
+        # The account and its default-group membership are written together:
+        # if the group is not configured, assign_default_group() raises and the
+        # transaction rolls the account back, so no orphan user is left behind.
+        with transaction.atomic():
+            user = User.objects.create_user(**validated_data)
+            assign_default_group(user)
+        return user
 
     def to_representation(self, instance):
         # Respond with the same safe shape used by /auth/me/, so a freshly

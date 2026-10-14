@@ -109,6 +109,8 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'users.apps.UsersConfig',
+    'challenges.apps.ChallengesConfig',
+    'submissions.apps.SubmissionsConfig',
 ]
 
 MIDDLEWARE = [
@@ -213,6 +215,13 @@ REST_FRAMEWORK = {
         'rest_framework_simplejwt.authentication.JWTAuthentication',
         'rest_framework.authentication.SessionAuthentication',
     ],
+    # Per-user rate limits (throttling.FlagSubmitThrottle / HintRevealThrottle).
+    # Uses the default cache; deploy a shared cache (e.g. Redis) so the limits
+    # are enforced consistently across processes.
+    'DEFAULT_THROTTLE_RATES': {
+        'flag_submit': '5/minute',
+        'hint_reveal': '20/minute',
+    },
 }
 
 
