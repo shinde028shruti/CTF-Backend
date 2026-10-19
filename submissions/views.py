@@ -4,6 +4,7 @@
     POST /api/v1/challenges/{id}/hints/{hint_id}/reveal/
     GET  /api/v1/leaderboard/                            (public, paginated)
     GET  /api/v1/leaderboard/me/                         (authenticated)
+    GET  /api/v1/stats/me/                               (authenticated)
 
 Only *published* challenges are reachable; a draft or an unknown id both return
 the same 404, so nothing about unpublished content leaks. The submitted flag is
@@ -36,13 +37,18 @@ from .leaderboard import (
     ranking_queryset,
 )
 from .models import HintUnlock, Submission
-from .serializers import FlagSubmissionSerializer, LeaderboardEntrySerializer
+from .serializers import (
+    FlagSubmissionSerializer,
+    LeaderboardEntrySerializer,
+    UserStatsSerializer,
+)
 from .services import (
     UNLOCK_STATUS_ALREADY,
     UNLOCK_STATUS_INSUFFICIENT,
     award_solve,
     unlock_hint,
 )
+from .stats import build_user_statistics
 from .throttling import FlagSubmitThrottle, HintRevealThrottle
 
 
@@ -290,3 +296,24 @@ class LeaderboardMeView(APIView):
         ).data
         data['rank'] = rank_for(user, period=period, category_id=category_id)
         return Response(data)
+
+
+# ─── Per-user statistics ─────────────────────────────────────────────────
+
+
+class UserStatsView(APIView):
+    """GET /api/v1/stats/me/ - the caller's own dashboard/profile statistics.
+
+    Authenticated only. Every value is derived server-side from the caller's
+    own solves, hint unlocks and submissions (see ``stats.py``); the response is
+    a closed projection that never exposes another user's data or any private
+    account field. Returns ``rank: null`` for a player who has not solved
+    anything yet.
+    """
+
+    permission_classes = [IsAuthenticated]
+    http_method_names = ['get', 'head', 'options']
+
+    def get(self, request):
+        stats = build_user_statistics(request.user)
+        return Response(UserStatsSerializer(stats).data)

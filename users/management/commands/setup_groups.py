@@ -51,6 +51,15 @@ GRANTED = {
         'challenges.add_challenge',
         'challenges.change_challenge',
         'challenges.delete_challenge',
+        'announcements.view_announcement',
+        'announcements.add_announcement',
+        'announcements.change_announcement',
+        'announcements.delete_announcement',
+        'achievements.view_achievement',
+        'achievements.add_achievement',
+        'achievements.change_achievement',
+        'achievements.delete_achievement',
+        'achievements.view_userachievement',
     ],
 }
 

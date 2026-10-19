@@ -22,16 +22,21 @@ from django.dispatch import receiver
 from django.utils.text import slugify
 
 
-def unique_slug(model, value, instance_pk=None):
+def unique_slug(model, value, instance_pk=None, queryset=None):
     """Return a slug for ``value`` that is unique within ``model``.
 
     The frontend addresses challenges by numeric id, so slugs are only a
     human-friendly extra. They are still kept unique to avoid surprising
     collisions if they are ever used in a URL.
+
+    ``queryset`` lets a caller widen the clash check beyond the model's default
+    manager (e.g. ``Achievement.all_objects`` so soft-deleted rows, which still
+    occupy their slug in the database, are taken into account).
     """
     base = slugify(value) or 'item'
     slug = base
-    queryset = model.objects.all()
+    if queryset is None:
+        queryset = model.objects.all()
     if instance_pk is not None:
         queryset = queryset.exclude(pk=instance_pk)
     suffix = 2

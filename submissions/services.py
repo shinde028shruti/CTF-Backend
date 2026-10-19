@@ -9,15 +9,21 @@ The denormalised ``User.points`` and ``Challenge.solves`` counters are updated
 with atomic ``F()`` expressions in the same transaction.
 """
 
+import logging
+
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import F
 
 from challenges.models import Challenge
+from notifications.models import Notification
+from notifications.services import notify
 
 from .models import HintUnlock, Solve
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 # ``unlock_hint`` outcomes.
 UNLOCK_STATUS_UNLOCKED = 'unlocked'
@@ -66,6 +72,43 @@ def award_solve(user, challenge):
         Challenge.objects.filter(pk=locked.pk).update(
             solves=F('solves') + 1
         )
+
+        # Notify the solver exactly once. This branch is only reached by the
+        # call that actually created the Solve row - every repeat or concurrent
+        # call returns early above - and it runs inside the same transaction, so
+        # a rollback drops the notification together with the solve. The message
+        # names the challenge and never the submitted flag (which is not even
+        # available here).
+        notify(
+            recipient=user,
+            type=Notification.TYPE_CHALLENGE,
+            title='Challenge solved',
+            message=f'You solved "{locked.title}".',
+            destination_url=f'/challenges/{locked.pk}',
+        )
+
+        # Evaluate achievements in the same transaction, only on the call that
+        # actually recorded a new solve. The evaluator reads trusted DB history
+        # and dispatches on validated criteria types; it never inspects the
+        # submitted flag (which is not even available here) and awards nothing on
+        # a repeat submission.
+        #
+        # It is isolated in its own savepoint and its failures are logged, not
+        # raised: an achievement bug must never roll back a legitimate solve or
+        # corrupt scoring/leaderboard state. A partial evaluation either fully
+        # commits or fully rolls back its own awards.
+        try:
+            with transaction.atomic():
+                from achievements.services import evaluate_achievements
+
+                evaluate_achievements(user)
+        except Exception:  # pragma: no cover - defensive isolation
+            logger.exception(
+                'Achievement evaluation failed for user %s after solve %s',
+                user.pk,
+                locked.pk,
+            )
+
         return True, solve
 
 

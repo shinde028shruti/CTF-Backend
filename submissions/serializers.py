@@ -67,3 +67,88 @@ class LeaderboardEntrySerializer(serializers.ModelSerializer):
         """The scoped category name, when the board is category-scoped."""
         return self.context.get('meta', '')
 
+
+class SubmissionsSummarySerializer(serializers.Serializer):
+    """Correct vs total flag attempts, used to derive accuracy."""
+
+    total = serializers.IntegerField()
+    correct = serializers.IntegerField()
+
+
+class CategoryProgressSerializer(serializers.Serializer):
+    """One category's published total and the caller's own progress in it."""
+
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    color = serializers.CharField(allow_blank=True)
+    solved = serializers.IntegerField()
+    total = serializers.IntegerField()
+    points = serializers.IntegerField()
+
+
+class ActivityEntrySerializer(serializers.Serializer):
+    """One solve or hint-unlock event in the caller's recent history.
+
+    ``points`` is the gross reward for a solve, ``cost`` the amount spent on a
+    hint; exactly one of them is non-zero per entry.
+    """
+
+    type = serializers.CharField()
+    challengeId = serializers.IntegerField()
+    challengeName = serializers.CharField()
+    points = serializers.IntegerField()
+    cost = serializers.IntegerField()
+    timestamp = serializers.DateTimeField()
+
+
+class ProgressPointSerializer(serializers.Serializer):
+    label = serializers.CharField()
+    points = serializers.IntegerField()
+
+
+class ProgressSerializer(serializers.Serializer):
+    weekly = ProgressPointSerializer(many=True)
+    monthly = ProgressPointSerializer(many=True)
+
+
+class ProgressionSerializer(serializers.Serializer):
+    """The caller's derived level / tier / Elite progression.
+
+    A pure projection of the caller's ``earnedPoints`` (see ``progression.py``);
+    it involves no other user's data and no private account field.
+    """
+
+    level = serializers.IntegerField()
+    tier = serializers.CharField()
+    points = serializers.IntegerField()
+    levelMin = serializers.IntegerField()
+    nextLevelMin = serializers.IntegerField(allow_null=True)
+    toNext = serializers.IntegerField()
+    progressPct = serializers.IntegerField()
+    elitePct = serializers.IntegerField()
+    isMax = serializers.BooleanField()
+
+
+class UserStatsSerializer(serializers.Serializer):
+    """The caller's own private statistics.
+
+    The field list is explicit and closed, so no other user's data and no
+    private account field (email, password hash, tokens, staff/superuser flags)
+    can ever be serialized here. ``rank`` is ``null`` when the caller has not
+    solved anything yet; ``joinDate`` is the account's ``date_joined``.
+    """
+
+    points = serializers.IntegerField()
+    earnedPoints = serializers.IntegerField()
+    spentOnHints = serializers.IntegerField()
+    solved = serializers.IntegerField()
+    accuracy = serializers.IntegerField()
+    submissions = SubmissionsSummarySerializer()
+    rank = serializers.IntegerField(allow_null=True)
+    joinDate = serializers.DateTimeField(allow_null=True)
+    solvedChallengeIds = serializers.ListField(child=serializers.IntegerField())
+    categoryProgress = CategoryProgressSerializer(many=True)
+    recentActivity = ActivityEntrySerializer(many=True)
+    progress = ProgressSerializer()
+    progression = ProgressionSerializer()
+

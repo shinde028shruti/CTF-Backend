@@ -5,6 +5,7 @@ from .views import (
     HintRevealView,
     LeaderboardMeView,
     LeaderboardView,
+    UserStatsView,
 )
 
 app_name = 'submissions_api'
@@ -22,4 +23,5 @@ urlpatterns = [
     ),
     path('leaderboard/', LeaderboardView.as_view(), name='leaderboard'),
     path('leaderboard/me/', LeaderboardMeView.as_view(), name='leaderboard-me'),
+    path('stats/me/', UserStatsView.as_view(), name='user-stats'),
 ]

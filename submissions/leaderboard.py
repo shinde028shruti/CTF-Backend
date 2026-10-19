@@ -160,6 +160,15 @@ def ranking_queryset(*, period=ALL_TIME, category_id=None, now=None):
             is_active=True,
             role=User.ROLE_USER,
             is_superuser=False,
+            # Profile visibility is enforced here, at the one public surface
+            # that exposes other players (their name, rank and score). A
+            # `private` account is omitted from every ranking scope - the
+            # public board, the caller's own standing and the derived
+            # `/stats/me/` rank all read this same queryset, so a private
+            # player is consistently unranked rather than ranked in one place
+            # and hidden in another. Admin analytics use their own query and
+            # are unaffected.
+            profile_visibility=User.VISIBILITY_PUBLIC,
         )
         .annotate(
             solved_count=solved_count,

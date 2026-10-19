@@ -107,10 +107,14 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'users.apps.UsersConfig',
     'challenges.apps.ChallengesConfig',
     'submissions.apps.SubmissionsConfig',
+    'notifications.apps.NotificationsConfig',
+    'announcements.apps.AnnouncementsConfig',
+    'achievements.apps.AchievementsConfig',
 ]
 
 MIDDLEWARE = [
@@ -221,6 +225,7 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'flag_submit': '5/minute',
         'hint_reveal': '20/minute',
+        'password_change': '5/minute',
     },
 }
 
@@ -228,6 +233,11 @@ REST_FRAMEWORK = {
 # Simple JWT
 # https://django-rest-framework-simplejwt.readthedocs.io/en/latest/settings/
 # No SIGNING_KEY is set here, so tokens are signed with SECRET_KEY above.
+#
+# `rest_framework_simplejwt.token_blacklist` (INSTALLED_APPS above) records
+# every issued refresh token and lets logout / password change invalidate them.
+# Access tokens remain stateless and valid until they expire - blacklisting
+# stops renewal, it does not retroactively revoke an access token.
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(

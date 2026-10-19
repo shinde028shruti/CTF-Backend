@@ -1,15 +1,21 @@
-from io import StringIO
+import os
+import shutil
+import tempfile
+from io import BytesIO, StringIO
 
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.models import Group, Permission
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import models
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
+from PIL import Image
 from rest_framework import status
 from rest_framework.permissions import DjangoModelPermissions
 from rest_framework.test import APIClient, APIRequestFactory
@@ -460,6 +466,11 @@ ADMIN_GROUP_PERMS = {
     'auth.view_group', 'auth.add_group', 'auth.change_group', 'auth.delete_group',
     'challenges.view_challenge', 'challenges.add_challenge',
     'challenges.change_challenge', 'challenges.delete_challenge',
+    'announcements.view_announcement', 'announcements.add_announcement',
+    'announcements.change_announcement', 'announcements.delete_announcement',
+    'achievements.view_achievement', 'achievements.add_achievement',
+    'achievements.change_achievement', 'achievements.delete_achievement',
+    'achievements.view_userachievement',
 }
 
 # Permissions a Challenge Creator holds. These are a strict subset of the Admin
@@ -1570,3 +1581,683 @@ class AdminGroupListTests(AdminUserAPITestCase):
         names = [g['name'] for g in response.data]
         self.assertIn('Admin', names)
         self.assertIn('User', names)
+
+
+# ---------------------------------------------------------------------------
+# Editable profile: persistence, authorization, validation, partial updates
+# ---------------------------------------------------------------------------
+
+
+def make_png_file(name='avatar.png', size=(8, 8)):
+    """A real, tiny PNG the ImageField/Pillow will accept."""
+    buffer = BytesIO()
+    Image.new('RGB', size, (12, 34, 56)).save(buffer, format='PNG')
+    return SimpleUploadedFile(name, buffer.getvalue(), content_type='image/png')
+
+
+def make_large_png_file(name='large.png'):
+    """A genuine PNG that exceeds the 2 MB avatar limit.
+
+    Random pixels barely compress, so a 1000x1000 RGB image reliably exceeds
+    the limit while still being a valid image Pillow opens successfully.
+    """
+    image = Image.frombytes('RGB', (1000, 1000), os.urandom(1000 * 1000 * 3))
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    return SimpleUploadedFile(name, buffer.getvalue(), content_type='image/png')
+
+
+class ProfileModelFieldTests(TestCase):
+    def test_new_profile_fields_default_to_blank(self):
+        user = get_user_model().objects.create_user(
+            username='blank', email='blank@example.com', password=VALID_PASSWORD,
+        )
+        self.assertEqual(user.display_name, '')
+        self.assertEqual(user.website, '')
+        self.assertEqual(user.twitter, '')
+        self.assertEqual(user.github, '')
+
+
+class ProfileUpdateTests(AuthAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+        self.onboarding_payload = {
+            'skillLevel': 'beginner',
+            'teamInterest': 'both',
+            'focusAreas': ['OSINT'],
+            'purpose': 'competitive',
+            'experienceType': 'student',
+        }
+
+    def patch(self, payload, user=None):
+        return self.client.patch(
+            self.me_url, payload, format='json',
+            **self.auth_header_for(user or self.user),
+        )
+
+    # -- persistence -----------------------------------------------------
+    def test_update_persists_across_a_fresh_read(self):
+        response = self.patch({
+            'display_name': 'Om the Great',
+            'bio': 'CTF enthusiast',
+            'website': 'https://om.example.com',
+            'twitter': '@om',
+            'github': 'om',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, 'Om the Great')
+        self.assertEqual(self.user.bio, 'CTF enthusiast')
+        self.assertEqual(self.user.website, 'https://om.example.com')
+        self.assertEqual(self.user.twitter, '@om')
+        self.assertEqual(self.user.github, 'om')
+
+        # The response echoes the saved values...
+        self.assertEqual(response.data['display_name'], 'Om the Great')
+        self.assertEqual(response.data['website'], 'https://om.example.com')
+        # ...and so does a completely fresh GET (the reload case).
+        again = self.client.get(self.me_url, **self.auth_header_for(self.user))
+        self.assertEqual(again.data['bio'], 'CTF enthusiast')
+        self.assertEqual(again.data['github'], 'om')
+
+    def test_display_name_is_trimmed(self):
+        self.patch({'display_name': '  Padded  '})
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, 'Padded')
+
+    # -- authorization ---------------------------------------------------
+    def test_anonymous_update_is_rejected(self):
+        response = self.client.patch(self.me_url, {'bio': 'sneaky'}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.bio, '')
+
+    def test_update_only_affects_the_calling_user(self):
+        other = self.User.objects.create_user(
+            username='other', email='other@example.com', password=VALID_PASSWORD,
+        )
+        self.patch({'bio': 'mine'})
+        other.refresh_from_db()
+        self.assertEqual(other.bio, '')
+
+    def test_privileged_fields_cannot_be_changed(self):
+        response = self.patch({
+            'role': 'admin',
+            'points': 999999,
+            'status': 'banned',
+            'is_active': False,
+            'is_staff': True,
+            'is_superuser': True,
+            'onboardingCompleted': True,
+            'username': 'hacked',
+            'email': 'attacker@example.com',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.role, self.User.ROLE_USER)
+        self.assertEqual(self.user.points, 0)
+        self.assertEqual(self.user.status, self.User.STATUS_ACTIVE)
+        self.assertTrue(self.user.is_active)
+        self.assertFalse(self.user.is_staff)
+        self.assertFalse(self.user.is_superuser)
+        self.assertFalse(self.user.onboardingCompleted)
+        self.assertEqual(self.user.username, 'om')
+        self.assertEqual(self.user.email, 'om@example.com')
+
+    # -- partial updates -------------------------------------------------
+    def test_partial_update_leaves_other_fields_untouched(self):
+        self.patch({
+            'display_name': 'Om',
+            'website': 'https://a.example.com',
+            'twitter': '@a',
+        })
+        response = self.patch({'bio': 'only the bio changed'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.bio, 'only the bio changed')
+        self.assertEqual(self.user.display_name, 'Om')
+        self.assertEqual(self.user.website, 'https://a.example.com')
+        self.assertEqual(self.user.twitter, '@a')
+
+    def test_update_does_not_clear_onboarding_answers(self):
+        self.client.post(
+            self.onboarding_url, self.onboarding_payload, format='json',
+            **self.auth_header_for(self.user),
+        )
+        self.patch({'bio': 'still here'})
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.onboardingCompleted)
+        self.assertEqual(self.user.onboarding['skillLevel'], 'beginner')
+        self.assertEqual(self.user.onboarding['focusAreas'], ['OSINT'])
+
+    # -- validation ------------------------------------------------------
+    def test_invalid_website_url_is_rejected(self):
+        response = self.patch({'website': 'not a url'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('website', response.data)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.website, '')
+
+    def test_blank_display_name_is_rejected(self):
+        response = self.patch({'display_name': '   '})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('display_name', response.data)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.display_name, '')
+
+    def test_overlong_bio_is_rejected(self):
+        response = self.patch({'bio': 'x' * 501})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('bio', response.data)
+
+    def test_overlong_display_name_is_rejected(self):
+        response = self.patch({'display_name': 'x' * 81})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('display_name', response.data)
+
+    # -- method surface --------------------------------------------------
+    def test_put_is_not_allowed(self):
+        response = self.client.put(
+            self.me_url, {'bio': 'x'}, format='json',
+            **self.auth_header_for(self.user),
+        )
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class AvatarUploadTests(AuthAPITestCase):
+    """Avatar upload, replacement, deletion and file cleanup."""
+
+    def setUp(self):
+        super().setUp()
+        self.media_root = tempfile.mkdtemp(prefix='ctf-avatars-')
+        self.addCleanup(shutil.rmtree, self.media_root, True)
+        self._override = override_settings(MEDIA_ROOT=self.media_root)
+        self._override.enable()
+        self.addCleanup(self._override.disable)
+
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+        self.avatar_url = reverse('auth:me-avatar')
+
+    def upload(self, file, user=None):
+        return self.client.patch(
+            self.me_url, {'avatar': file}, format='multipart',
+            **self.auth_header_for(user or self.user),
+        )
+
+    def test_valid_image_is_stored_and_url_returned(self):
+        response = self.upload(make_png_file('me.png'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.avatar)
+        self.assertTrue(self.user.avatar.name.startswith('avatars/'))
+        self.assertTrue(os.path.exists(self.user.avatar.path))
+        self.assertIn('/media/avatars/', response.data['avatar'])
+
+    def test_avatar_survives_a_fresh_read(self):
+        self.upload(make_png_file())
+        fresh = self.client.get(self.me_url, **self.auth_header_for(self.user))
+        self.assertTrue(fresh.data['avatar'])
+        self.assertIn('/media/', fresh.data['avatar'])
+
+    def test_replacing_the_avatar_deletes_the_old_file(self):
+        self.upload(make_png_file('first.png'))
+        self.user.refresh_from_db()
+        old_name, old_path = self.user.avatar.name, self.user.avatar.path
+        self.assertTrue(os.path.exists(old_path))
+
+        self.upload(make_png_file('second.png'))
+        self.user.refresh_from_db()
+
+        self.assertNotEqual(self.user.avatar.name, old_name)
+        self.assertFalse(os.path.exists(old_path), 'old avatar file should be removed')
+        self.assertTrue(os.path.exists(self.user.avatar.path))
+
+    def test_failed_replacement_keeps_the_existing_avatar(self):
+        self.upload(make_png_file('keep.png'))
+        self.user.refresh_from_db()
+        old_name, old_path = self.user.avatar.name, self.user.avatar.path
+
+        response = self.upload(
+            SimpleUploadedFile('bad.txt', b'not an image', content_type='text/plain'),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.avatar.name, old_name)
+        self.assertTrue(os.path.exists(old_path))
+
+    def test_delete_endpoint_removes_file_and_clears_field(self):
+        self.upload(make_png_file())
+        self.user.refresh_from_db()
+        path = self.user.avatar.path
+
+        response = self.client.delete(
+            self.avatar_url, **self.auth_header_for(self.user),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.avatar)
+        self.assertIsNone(response.data['avatar'])
+        self.assertFalse(os.path.exists(path))
+
+    def test_patching_avatar_null_clears_it(self):
+        self.upload(make_png_file())
+        self.user.refresh_from_db()
+        path = self.user.avatar.path
+
+        response = self.client.patch(
+            self.me_url, {'avatar': None}, format='json',
+            **self.auth_header_for(self.user),
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.avatar)
+        self.assertFalse(os.path.exists(path))
+
+    def test_oversized_image_is_rejected(self):
+        response = self.upload(make_large_png_file())
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('avatar', response.data)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.avatar)
+
+    def test_non_image_upload_is_rejected(self):
+        response = self.upload(
+            SimpleUploadedFile('notes.txt', b'just text', content_type='text/plain'),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('avatar', response.data)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.avatar)
+
+    def test_malformed_image_is_rejected(self):
+        response = self.upload(
+            SimpleUploadedFile('broken.png', b'not really a png', content_type='image/png'),
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('avatar', response.data)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.avatar)
+
+    def test_anonymous_upload_is_rejected(self):
+        response = self.client.patch(
+            self.me_url, {'avatar': make_png_file()}, format='multipart',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_upload_only_affects_the_calling_user(self):
+        other = self.User.objects.create_user(
+            username='other', email='other@example.com', password=VALID_PASSWORD,
+        )
+        self.upload(make_png_file())
+        other.refresh_from_db()
+        self.assertFalse(other.avatar)
+
+    def test_anonymous_avatar_delete_is_rejected(self):
+        response = self.client.delete(self.avatar_url)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class OnboardingValidationTests(AuthAPITestCase):
+    """Malformed questionnaire payloads are rejected without side effects."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+        self.valid = {
+            'skillLevel': 'beginner',
+            'teamInterest': 'both',
+            'focusAreas': ['OSINT'],
+            'purpose': 'competitive',
+            'experienceType': 'student',
+        }
+
+    def submit(self, payload):
+        return self.client.post(
+            self.onboarding_url, payload, format='json',
+            **self.auth_header_for(self.user),
+        )
+
+    def test_focus_areas_wrong_type_is_rejected(self):
+        response = self.submit(dict(self.valid, focusAreas='OSINT'))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.onboardingCompleted)
+
+    def test_overlong_answer_is_rejected(self):
+        response = self.submit(dict(self.valid, skillLevel='x' * 100))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.onboardingCompleted)
+
+
+class UserPreferencesModelTests(TestCase):
+    """The new preference columns default sensibly for every existing row."""
+
+    def test_defaults_are_safe(self):
+        user = get_user_model().objects.create_user(
+            username='prefs', email='prefs@example.com', password=VALID_PASSWORD,
+        )
+        self.assertEqual(user.notification_prefs, {})
+        self.assertEqual(
+            user.profile_visibility, get_user_model().VISIBILITY_PUBLIC,
+        )
+
+
+class PreferencesEndpointTests(AuthAPITestCase):
+    """PATCH /auth/me/preferences/ - persistence, validation and isolation."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = reverse('auth:me-preferences')
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+
+    def patch(self, payload, user=None):
+        return self.client.patch(
+            self.url, payload, format='json',
+            **self.auth_header_for(user or self.user),
+        )
+
+    # -- authorization ---------------------------------------------------
+    def test_requires_authentication(self):
+        response = self.client.patch(
+            self.url, {'profile_visibility': 'private'}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_only_affects_the_calling_user(self):
+        other = self.User.objects.create_user(
+            username='other', email='other@example.com', password=VALID_PASSWORD,
+        )
+        self.patch({
+            'notification_prefs': {'rank_changes': True},
+            'profile_visibility': 'private',
+        })
+        other.refresh_from_db()
+        self.assertEqual(other.notification_prefs, {})
+        self.assertEqual(other.profile_visibility, self.User.VISIBILITY_PUBLIC)
+
+        # The response reflects the caller, never another account.
+        mine = self.client.get(self.me_url, **self.auth_header_for(other))
+        self.assertEqual(mine.data['profile_visibility'], 'public')
+
+    # -- defaults & persistence -----------------------------------------
+    def test_defaults_are_returned_before_anything_is_saved(self):
+        response = self.client.get(self.me_url, **self.auth_header_for(self.user))
+        self.assertEqual(response.data['profile_visibility'], 'public')
+        self.assertEqual(response.data['notification_prefs'], {
+            'solves': True,
+            'achievements': True,
+            'new_challenges': True,
+            'events': True,
+            'rank_changes': False,
+        })
+
+    def test_persists_notification_preferences(self):
+        response = self.patch({
+            'notification_prefs': {'rank_changes': True, 'events': False},
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['notification_prefs']['rank_changes'])
+        self.assertFalse(response.data['notification_prefs']['events'])
+        # A flag that was not sent keeps its default rather than being dropped.
+        self.assertTrue(response.data['notification_prefs']['solves'])
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.notification_prefs['rank_changes'])
+        self.assertFalse(self.user.notification_prefs['events'])
+
+        # A completely fresh /me/ read (the reload/login case) shows the value.
+        again = self.client.get(self.me_url, **self.auth_header_for(self.user))
+        self.assertTrue(again.data['notification_prefs']['rank_changes'])
+
+    def test_partial_update_does_not_clear_other_flags(self):
+        self.patch({'notification_prefs': {'rank_changes': True}})
+        self.patch({'notification_prefs': {'events': False}})
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.notification_prefs['rank_changes'])
+        self.assertFalse(self.user.notification_prefs['events'])
+
+    def test_persists_profile_visibility(self):
+        response = self.patch({'profile_visibility': 'private'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['profile_visibility'], 'private')
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.profile_visibility, 'private')
+        again = self.client.get(self.me_url, **self.auth_header_for(self.user))
+        self.assertEqual(again.data['profile_visibility'], 'private')
+
+    # -- validation ------------------------------------------------------
+    def test_unknown_preference_key_is_rejected(self):
+        response = self.patch({'notification_prefs': {'telepathy': True}})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('notification_prefs', response.data)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.notification_prefs, {})
+
+    def test_non_boolean_preference_value_is_rejected(self):
+        response = self.patch({'notification_prefs': {'solves': 'yes'}})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.notification_prefs, {})
+
+    def test_non_object_preferences_are_rejected(self):
+        for bad in ([], 'solves', 5):
+            response = self.patch({'notification_prefs': bad})
+            self.assertEqual(
+                response.status_code, status.HTTP_400_BAD_REQUEST, bad,
+            )
+
+    def test_invalid_visibility_is_rejected(self):
+        response = self.patch({'profile_visibility': 'invisible'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.profile_visibility, 'public')
+
+    def test_privileged_fields_cannot_be_changed_through_preferences(self):
+        response = self.patch({
+            'role': 'admin',
+            'points': 999999,
+            'email': 'attacker@example.com',
+            'is_superuser': True,
+            'username': 'hacked',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.role, self.User.ROLE_USER)
+        self.assertEqual(self.user.points, 0)
+        self.assertNotEqual(self.user.email, 'attacker@example.com')
+        self.assertFalse(self.user.is_superuser)
+        self.assertEqual(self.user.username, 'om')
+
+
+class ChangePasswordEndpointTests(AuthAPITestCase):
+    """POST /auth/password/ - ownership, validation and token revocation."""
+
+    NEW_PASSWORD = 'An0ther-Str0ng!7'
+
+    def setUp(self):
+        super().setUp()
+        # The throttle cache is process-global and is not rolled back with the
+        # database, so clear it to keep each test independent of the last.
+        cache.clear()
+        self.url = reverse('auth:password-change')
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+
+    def change(self, payload, user=None):
+        return self.client.post(
+            self.url, payload, format='json',
+            **self.auth_header_for(user or self.user),
+        )
+
+    def payload(self, current=VALID_PASSWORD, new=NEW_PASSWORD, confirm=None):
+        return {
+            'current_password': current,
+            'new_password': new,
+            'new_password2': new if confirm is None else confirm,
+        }
+
+    # -- authorization ---------------------------------------------------
+    def test_requires_authentication(self):
+        response = self.client.post(self.url, self.payload(), format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_only_affects_the_calling_user(self):
+        other = self.User.objects.create_user(
+            username='other', email='other@example.com', password=VALID_PASSWORD,
+        )
+        self.change(self.payload())
+        other.refresh_from_db()
+        self.assertTrue(other.check_password(VALID_PASSWORD))
+
+    # -- success ---------------------------------------------------------
+    def test_changes_the_password(self):
+        response = self.change(self.payload())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.NEW_PASSWORD))
+        self.assertIsNone(authenticate(username='om', password=VALID_PASSWORD))
+        self.assertIsNotNone(authenticate(username='om', password=self.NEW_PASSWORD))
+
+    def test_response_never_contains_a_password(self):
+        response = self.change(self.payload())
+        text = response.content.decode()
+        self.assertNotIn(self.NEW_PASSWORD, text)
+        self.assertNotIn(VALID_PASSWORD, text)
+        self.assertNotIn('new_password', text)
+        self.assertNotIn('password', response.data)
+
+    # -- validation ------------------------------------------------------
+    def test_wrong_current_password_is_rejected(self):
+        response = self.change(self.payload(current='not-my-password'))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('current_password', response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(VALID_PASSWORD))
+
+    def test_mismatched_confirmation_is_rejected(self):
+        response = self.change(self.payload(confirm='D1fferent-Str0ng!7'))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('new_password2', response.data)
+
+    def test_weak_new_password_is_rejected(self):
+        # Django's NumericPasswordValidator / MinimumLengthValidator reject this.
+        response = self.change(self.payload(new='12345678'))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('new_password', response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(VALID_PASSWORD))
+
+    def test_reusing_the_current_password_is_rejected(self):
+        response = self.change(self.payload(new=VALID_PASSWORD))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('new_password', response.data)
+
+    # -- token behaviour -------------------------------------------------
+    def test_blacklists_the_refresh_token_from_login(self):
+        login = self.client.post(
+            self.login_url,
+            {'username': 'om', 'password': VALID_PASSWORD},
+            format='json',
+        )
+        self.assertEqual(login.status_code, status.HTTP_200_OK, login.content)
+        old_refresh = login.data['refresh']
+
+        # Usable before the change...
+        before = self.client.post(
+            self.refresh_url, {'refresh': old_refresh}, format='json',
+        )
+        self.assertEqual(before.status_code, status.HTTP_200_OK, before.content)
+
+        changed = self.change(self.payload())
+        self.assertEqual(changed.status_code, status.HTTP_200_OK, changed.content)
+
+        # ...and revoked afterwards.
+        after = self.client.post(
+            self.refresh_url, {'refresh': old_refresh}, format='json',
+        )
+        self.assertEqual(after.status_code, status.HTTP_401_UNAUTHORIZED, after.content)
+
+    def test_blacklists_refresh_tokens_minted_for_the_user(self):
+        token = str(RefreshToken.for_user(self.user))
+        changed = self.change(self.payload())
+        self.assertEqual(changed.status_code, status.HTTP_200_OK)
+        after = self.client.post(
+            self.refresh_url, {'refresh': token}, format='json',
+        )
+        self.assertEqual(after.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class LogoutEndpointTests(AuthAPITestCase):
+    """POST /auth/logout/ - revokes a refresh token, safely and idempotently."""
+
+    def setUp(self):
+        super().setUp()
+        self.url = reverse('auth:logout')
+        self.user = self.User.objects.create_user(
+            username='om', email='om@example.com', password=VALID_PASSWORD,
+        )
+
+    def login_refresh(self):
+        login = self.client.post(
+            self.login_url,
+            {'username': 'om', 'password': VALID_PASSWORD},
+            format='json',
+        )
+        self.assertEqual(login.status_code, status.HTTP_200_OK, login.content)
+        return login.data['refresh']
+
+    def test_blacklists_a_valid_refresh_token(self):
+        token = self.login_refresh()
+        response = self.client.post(self.url, {'refresh': token}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+
+        after = self.client.post(self.refresh_url, {'refresh': token}, format='json')
+        self.assertEqual(after.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_does_not_require_authentication(self):
+        token = str(RefreshToken.for_user(self.user))
+        response = self.client.post(self.url, {'refresh': token}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_missing_refresh_token_is_safe(self):
+        response = self.client.post(self.url, {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_malformed_refresh_token_is_safe(self):
+        response = self.client.post(
+            self.url, {'refresh': 'not-a-real-token'}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_already_blacklisted_token_is_safe(self):
+        token = str(RefreshToken.for_user(self.user))
+        first = self.client.post(self.url, {'refresh': token}, format='json')
+        second = self.client.post(self.url, {'refresh': token}, format='json')
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+
+    def test_logout_token_cannot_refresh_afterwards(self):
+        token = str(RefreshToken.for_user(self.user))
+        self.client.post(self.url, {'refresh': token}, format='json')
+        after = self.client.post(
+            self.refresh_url, {'refresh': token}, format='json',
+        )
+        self.assertEqual(after.status_code, status.HTTP_401_UNAUTHORIZED)
+

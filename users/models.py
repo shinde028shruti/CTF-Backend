@@ -2,6 +2,25 @@ from django.contrib.auth.models import AbstractUser, UserManager
 from django.db import models
 from django.utils import timezone
 
+# Notification preferences the account settings page can toggle. This is the
+# single source of truth for both validation (only these keys are accepted) and
+# the defaults returned by the API, so the frontend never has to guess.
+NOTIFICATION_PREF_KEYS = (
+    'solves',
+    'achievements',
+    'new_challenges',
+    'events',
+    'rank_changes',
+)
+
+DEFAULT_NOTIFICATION_PREFS = {
+    'solves': True,
+    'achievements': True,
+    'new_challenges': True,
+    'events': True,
+    'rank_changes': False,
+}
+
 
 class SoftDeleteQuerySet(models.QuerySet):
     """QuerySet that turns a bulk ``.delete()`` into a soft delete."""
@@ -35,6 +54,15 @@ class User(AbstractUser):
     points = models.PositiveIntegerField(default=0)
     bio = models.TextField(blank=True, default='')
     avatar = models.ImageField(upload_to='avatars/', blank=True, null=True)
+
+    # Editable public profile, written through PATCH /api/v1/auth/me/.
+    # `display_name` is shown in place of the (immutable) username across the
+    # UI; the link columns are free-text handles/URLs the user can fill in.
+    # All of them default to blank so existing rows need no backfill.
+    display_name = models.CharField(max_length=80, blank=True, default='')
+    website = models.URLField(max_length=200, blank=True, default='')
+    twitter = models.CharField(max_length=100, blank=True, default='')
+    github = models.CharField(max_length=100, blank=True, default='')
 
     # Consumed by the frontend to gate routes and render the admin panel.
     # Django's built-in `is_staff` is deliberately not reused so the API
@@ -109,6 +137,29 @@ class User(AbstractUser):
     # experienceType, userType). Stored as JSON because the shape is defined by
     # the frontend flow and Dashboard/Challenges read focusAreas from it.
     onboarding = models.JSONField(default=dict, blank=True)
+
+    # Per-user notification preferences (Settings -> Notifications). Stored as
+    # JSON so the flag list can grow without a migration; the allowed keys and
+    # their types are validated by ``PreferencesSerializer`` and defaulted by
+    # ``DEFAULT_NOTIFICATION_PREFS`` above.
+    notification_prefs = models.JSONField(default=dict, blank=True)
+
+    # Whether this user may appear in public listings (the leaderboard). This is
+    # enforced server-side, not merely reflected in the UI: a ``private`` user is
+    # excluded from public ranking queries. It never restricts the user's own
+    # access to their own data or an administrator's access.
+    VISIBILITY_PUBLIC = 'public'
+    VISIBILITY_PRIVATE = 'private'
+    VISIBILITY_CHOICES = [
+        (VISIBILITY_PUBLIC, 'Public'),
+        (VISIBILITY_PRIVATE, 'Private'),
+    ]
+
+    profile_visibility = models.CharField(
+        max_length=8,
+        choices=VISIBILITY_CHOICES,
+        default=VISIBILITY_PUBLIC,
+    )
 
     @property
     def is_admin(self):

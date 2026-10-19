@@ -9,9 +9,12 @@ plaintext nor the stored hash ever appears in a response.
 import threading
 import time
 from datetime import timedelta
+from io import StringIO
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
 from django.core.cache import cache
+from django.core.management import call_command
 from django.db import IntegrityError, connection, transaction
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
@@ -20,6 +23,7 @@ from rest_framework.test import APIClient, APIRequestFactory
 from challenges.models import Category, Challenge, ChallengeFlag, ChallengeHint
 
 from .models import HintUnlock, Solve, Submission
+from .progression import ELITE_MIN, PROGRESSION_TIERS, progression_for
 from .services import (
     UNLOCK_STATUS_ALREADY,
     UNLOCK_STATUS_INSUFFICIENT,
@@ -1022,6 +1026,52 @@ class LeaderboardTests(TestCase):
         self.assertEqual(body['points'], 0)
         self.assertEqual(body['solved'], 0)
 
+    # ── Profile visibility ────────────────────────────────────────────
+
+    def _private_player(self, username, challenges=()):
+        user = self._player(username, challenges)
+        user.profile_visibility = User.VISIBILITY_PRIVATE
+        user.save(update_fields=['profile_visibility'])
+        return user
+
+    def test_private_player_is_hidden_from_the_public_board(self):
+        self._player('visible', [self.web_one])              # 100
+        hidden = self._private_player(
+            'hidden', [self.web_one, self.web_two]           # 150
+        )
+
+        body = self._rows()
+        self.assertEqual(self._usernames(body), ['visible'])
+        self.assertEqual(body['count'], 1)
+
+        # The hidden player is not ranked in their own standing either, so the
+        # public board and the caller's own rank can never disagree.
+        self.client.force_authenticate(user=hidden)
+        me = self.client.get(self.ME_URL).json()
+        self.assertIsNone(me['rank'])
+
+    def test_a_private_peer_does_not_shift_public_ranks(self):
+        self._player('visible', [self.web_one])              # 100
+        self._private_player(
+            'hidden', [self.web_one, self.crypto_one]        # 180 > visible
+        )
+
+        body = self._rows()
+        self.assertEqual(self._usernames(body), ['visible'])
+        self.assertEqual(body['results'][0]['rank'], 1)
+
+    def test_private_players_are_excluded_from_weekly_and_category_boards(self):
+        self._private_player('hidden', [self.web_one])
+        self.assertEqual(self._usernames(self._rows('?period=week')), [])
+        self.assertEqual(
+            self._usernames(self._rows(f'?category={self.web.id}')), []
+        )
+
+    def test_leaderboard_row_never_exposes_visibility(self):
+        self._player('visible', [self.web_one])
+        row = self._rows()['results'][0]
+        self.assertNotIn('profile_visibility', row)
+
     def test_excludes_admin_superuser_suspended_and_deleted(self):
         self._player('player', [self.web_one])
 
@@ -1117,3 +1167,658 @@ class LeaderboardTests(TestCase):
         self.assertEqual(body['rank'], 1)
         self.assertEqual(body['points'], 80)
         self.assertEqual(body['meta'], 'Cryptography')
+
+
+class UserStatsTests(TestCase):
+    """The private per-user dashboard/profile statistics endpoint.
+
+    Every value is a projection over stored solves/hint unlocks/submissions, so
+    the fixtures write those rows directly (and mirror ``User.points`` the way
+    the scoring service would). Only the caller's own data may ever be returned.
+    """
+
+    STATS_URL = '/api/v1/stats/me/'
+    LIST_URL = '/api/v1/leaderboard/'
+    PASSWORD = 'pass12345'
+
+    def setUp(self):
+        cache.clear()
+        self.web = Category.objects.create(
+            name='Web Exploitation', order=1, color='#3b82f6'
+        )
+        self.crypto = Category.objects.create(
+            name='Cryptography', order=2, color='#8b5cf6'
+        )
+        self.web_one = self._challenge('Web One', self.web, 100)
+        self.web_two = self._challenge('Web Two', self.web, 50)
+        self.crypto_one = self._challenge('Crypto One', self.crypto, 80)
+        self.draft = self._challenge(
+            'Hidden Draft', self.web, 999, status=Challenge.STATUS_DRAFT
+        )
+        self.client = APIClient()
+
+    # ── Fixture helpers ───────────────────────────────────────────────
+
+    def _challenge(self, title, category, points, status=None):
+        return Challenge.objects.create(
+            title=title,
+            category=category,
+            points=points,
+            status=status or Challenge.STATUS_PUBLISHED,
+        )
+
+    def _user(self, username, **kwargs):
+        return User.objects.create_user(
+            username,
+            f'{username}@example.com',
+            self.PASSWORD,
+            onboardingCompleted=True,
+            **kwargs,
+        )
+
+    def _hint(self, challenge, cost, order=0):
+        return ChallengeHint.objects.create(
+            challenge=challenge, text='a clue', cost=cost, order=order
+        )
+
+    def _player(self, username, challenges=()):
+        user = self._user(username)
+        for challenge in challenges:
+            award_solve(user, challenge)
+        user.refresh_from_db()
+        return user
+
+    def _submission(self, user, challenge, correct):
+        return Submission.objects.create(
+            user=user, challenge=challenge, correct=correct
+        )
+
+    def _get(self, user=None):
+        if user is not None:
+            self.client.force_authenticate(user=user)
+        response = self.client.get(self.STATS_URL)
+        return response
+
+    # ── Authorization & privacy ───────────────────────────────────────
+
+    def test_requires_authentication(self):
+        response = self.client.get(self.STATS_URL)
+        self.assertEqual(response.status_code, 401)
+
+    def test_returns_only_the_callers_own_statistics(self):
+        me = self._player('me', [self.web_one])          # 100
+        other = self._player('other', [self.web_one, self.web_two, self.crypto_one])
+
+        body = self._get(me).json()
+        self.assertEqual(body['solved'], 1)
+        self.assertEqual(body['earnedPoints'], 100)
+        self.assertEqual(body['points'], 100)
+
+        other_body = self._get(other).json()
+        self.assertEqual(other_body['solved'], 3)
+        self.assertEqual(other_body['earnedPoints'], 230)
+
+    def test_rank_is_null_for_a_private_account(self):
+        user = self._player('ghost', [self.web_one])          # 100
+        user.profile_visibility = User.VISIBILITY_PRIVATE
+        user.save(update_fields=['profile_visibility'])
+
+        body = self._get(user).json()
+        self.assertIsNone(body['rank'])
+        # Visibility only removes the account from ranking; the caller's own
+        # points/solves statistics are untouched.
+        self.assertEqual(body['earnedPoints'], 100)
+        self.assertEqual(body['solved'], 1)
+
+    def test_response_exposes_no_private_or_foreign_fields(self):
+        user = self._player('solo', [self.web_one])
+        body = self._get(user).json()
+        self.assertEqual(
+            set(body.keys()),
+            {
+                'points', 'earnedPoints', 'spentOnHints', 'solved', 'accuracy',
+                'submissions', 'rank', 'joinDate', 'solvedChallengeIds',
+                'categoryProgress', 'recentActivity', 'progress', 'progression',
+            },
+        )
+        for leaked in ('email', 'password', 'username', 'is_superuser', 'is_staff'):
+            self.assertNotIn(leaked, body)
+        self.assertEqual(set(body['submissions'].keys()), {'total', 'correct'})
+
+    # ── Points: spendable vs earned ───────────────────────────────────
+
+    def test_spendable_balance_is_separate_from_earned_points(self):
+        user = self._player('solo', [self.web_one])      # earns 100
+        hint = self._hint(self.web_one, cost=30)
+        outcome, _unlock, _remaining = unlock_hint(user, hint)
+        self.assertEqual(outcome, UNLOCK_STATUS_UNLOCKED)
+        user.refresh_from_db()
+
+        body = self._get(user).json()
+        self.assertEqual(body['earnedPoints'], 100)   # gross
+        self.assertEqual(body['spentOnHints'], 30)
+        self.assertEqual(body['points'], 70)          # net spendable
+        self.assertEqual(body['points'], user.points)
+
+    def test_hint_spending_does_not_change_earned_points(self):
+        user = self._player('solo', [self.web_one, self.web_two])  # 150
+        for cost in (10, 20):
+            unlock_hint(user, self._hint(self.web_one, cost=cost, order=cost))
+        user.refresh_from_db()
+
+        body = self._get(user).json()
+        self.assertEqual(body['earnedPoints'], 150)
+        self.assertEqual(body['spentOnHints'], 30)
+        self.assertEqual(body['points'], 120)
+
+    # ── Solves & accuracy ─────────────────────────────────────────────
+
+    def test_solved_counts_unique_solves_not_attempts(self):
+        user = self._user('solo')
+        award_solve(user, self.web_one)
+        # Many attempts, one of them correct, must still count as one solve.
+        self._submission(user, self.web_one, correct=False)
+        self._submission(user, self.web_one, correct=False)
+        self._submission(user, self.web_one, correct=True)
+        # A repeated correct submission never creates a second solve.
+        self._submission(user, self.web_one, correct=True)
+
+        body = self._get(user).json()
+        self.assertEqual(body['solved'], 1)
+        self.assertEqual(Submission.objects.filter(user=user).count(), 4)
+
+    def test_duplicate_award_solve_is_counted_once(self):
+        user = self._user('solo')
+        award_solve(user, self.web_one)
+        created, _solve = award_solve(user, self.web_one)
+        self.assertFalse(created)
+        user.refresh_from_db()
+
+        body = self._get(user).json()
+        self.assertEqual(body['solved'], 1)
+        self.assertEqual(body['earnedPoints'], 100)
+        self.assertEqual(body['points'], 100)
+
+    def test_accuracy_reflects_flag_submissions(self):
+        user = self._user('solo')
+        for _ in range(3):
+            self._submission(user, self.web_one, correct=True)
+        self._submission(user, self.web_one, correct=False)
+
+        body = self._get(user).json()
+        self.assertEqual(body['submissions'], {'total': 4, 'correct': 3})
+        self.assertEqual(body['accuracy'], 75)
+
+    # ── Rank ──────────────────────────────────────────────────────────
+
+    def test_rank_matches_the_leaderboard(self):
+        self._player('high', [self.web_one])          # 100, rank 1
+        low = self._player('low', [self.web_two])     # 50, rank 2
+
+        body = self._get(low).json()
+        board = self.client.get(self.LIST_URL).json()
+        board_rank = next(
+            row['rank'] for row in board['results'] if row['username'] == 'low'
+        )
+        self.assertEqual(body['rank'], 2)
+        self.assertEqual(body['rank'], board_rank)
+
+    # ── Category progress ─────────────────────────────────────────────
+
+    def test_category_progress_counts_published_challenges_only(self):
+        user = self._player('solo', [self.web_one, self.crypto_one])
+
+        body = self._get(user).json()
+        by_name = {row['name']: row for row in body['categoryProgress']}
+        # The draft in Web must not inflate the denominator.
+        self.assertEqual(by_name['Web Exploitation']['total'], 2)
+        self.assertEqual(by_name['Web Exploitation']['solved'], 1)
+        self.assertEqual(by_name['Web Exploitation']['points'], 100)
+        self.assertEqual(by_name['Cryptography']['total'], 1)
+        self.assertEqual(by_name['Cryptography']['solved'], 1)
+        self.assertEqual(by_name['Web Exploitation']['color'], '#3b82f6')
+
+    # ── Recent activity ───────────────────────────────────────────────
+
+    def test_recent_activity_orders_newest_first_with_types(self):
+        user = self._user('solo')
+        solve = Solve.objects.create(
+            user=user, challenge=self.web_one, points=self.web_one.points
+        )
+        Solve.objects.filter(pk=solve.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5)
+        )
+        hint = self._hint(self.web_two, cost=20)
+        unlock = HintUnlock.objects.create(
+            user=user, challenge=self.web_two, hint=hint, cost=hint.cost
+        )
+        HintUnlock.objects.filter(pk=unlock.pk).update(
+            created_at=timezone.now()
+        )
+
+        body = self._get(user).json()
+        activity = body['recentActivity']
+        self.assertEqual([entry['type'] for entry in activity], ['hint', 'solve'])
+        self.assertEqual(activity[0]['challengeName'], 'Web Two')
+        self.assertEqual(activity[0]['cost'], 20)
+        self.assertEqual(activity[0]['points'], 0)
+        self.assertEqual(activity[1]['challengeName'], 'Web One')
+        self.assertEqual(activity[1]['points'], 100)
+        self.assertEqual(activity[1]['cost'], 0)
+
+    # ── Users with no activity ────────────────────────────────────────
+
+    def test_no_activity_user_returns_zeroes_and_null_rank(self):
+        user = self._user('fresh')
+
+        body = self._get(user).json()
+        self.assertEqual(body['points'], 0)
+        self.assertEqual(body['earnedPoints'], 0)
+        self.assertEqual(body['spentOnHints'], 0)
+        self.assertEqual(body['solved'], 0)
+        self.assertEqual(body['accuracy'], 0)
+        self.assertEqual(body['submissions'], {'total': 0, 'correct': 0})
+        self.assertIsNone(body['rank'])
+        self.assertEqual(body['solvedChallengeIds'], [])
+        self.assertEqual(body['recentActivity'], [])
+        self.assertTrue(
+            all(row['solved'] == 0 for row in body['categoryProgress'])
+        )
+
+    # ── Progress chart ────────────────────────────────────────────────
+
+    def test_progress_weekly_and_monthly_are_net_of_hint_spending(self):
+        user = self._player('solo', [self.web_one])   # 100 today
+        unlock_hint(user, self._hint(self.web_one, cost=30))  # -30 today
+        self._submission(user, self.web_one, correct=True)
+
+        body = self._get(user).json()
+        weekly = body['progress']['weekly']
+        monthly = body['progress']['monthly']
+        self.assertEqual(len(weekly), 7)
+        self.assertEqual(len(monthly), 10)
+        self.assertEqual(sum(point['points'] for point in weekly), 70)
+        self.assertEqual(sum(point['points'] for point in monthly), 70)
+
+    # ── Progression (levels / rank / Elite) ───────────────────────────
+
+    def test_progression_boundaries_are_cumulative_and_capped(self):
+        # Landing exactly on a threshold enters the new tier; one point below
+        # stays on the previous one. (tier, level, levelMin, nextMin, pct, elite)
+        cases = {
+            0: ('Rookie', 1, 0, 100, 0, 0),
+            99: ('Rookie', 1, 0, 100, 99, 12),
+            100: ('Novice', 2, 100, 250, 0, 12),
+            249: ('Novice', 2, 100, 250, 99, 31),
+            250: ('Intermediate', 3, 250, 500, 0, 31),
+            400: ('Intermediate', 3, 250, 500, 60, 50),
+            499: ('Intermediate', 3, 250, 500, 99, 62),
+            500: ('Advanced', 4, 500, 800, 0, 62),
+            799: ('Advanced', 4, 500, 800, 99, 99),
+            800: ('Elite', 5, 800, None, 100, 100),
+            10000: ('Elite', 5, 800, None, 100, 100),
+        }
+        for points, expected in cases.items():
+            tier, level, level_min, next_min, pct, elite = expected
+            prog = progression_for(points)
+            self.assertEqual(prog['tier'], tier, points)
+            self.assertEqual(prog['level'], level, points)
+            self.assertEqual(prog['points'], points, points)
+            self.assertEqual(prog['levelMin'], level_min, points)
+            self.assertEqual(prog['nextLevelMin'], next_min, points)
+            self.assertEqual(prog['progressPct'], pct, points)
+            self.assertEqual(prog['elitePct'], elite, points)
+            self.assertEqual(prog['isMax'], next_min is None, points)
+            if next_min is None:
+                self.assertEqual(prog['toNext'], 0, points)
+            else:
+                self.assertEqual(prog['toNext'], next_min - points, points)
+
+    def test_progression_elite_percent_is_capped_at_100(self):
+        self.assertEqual(progression_for(ELITE_MIN)['elitePct'], 100)
+        self.assertEqual(progression_for(ELITE_MIN * 5)['elitePct'], 100)
+        self.assertEqual(progression_for(ELITE_MIN // 2)['elitePct'], 50)
+
+    def test_progression_ladder_is_strictly_increasing_from_zero(self):
+        mins = [minimum for _name, minimum in PROGRESSION_TIERS]
+        self.assertEqual(mins[0], 0)
+        self.assertEqual(mins, sorted(mins))
+        self.assertEqual(len(set(mins)), len(mins))
+        self.assertEqual(ELITE_MIN, mins[-1])
+
+    def test_progression_comes_from_earned_points_not_the_spendable_balance(self):
+        # A 100-point solve earns Novice regardless of what is later spent.
+        user = self._player('solo', [self.web_one])
+
+        before = self._get(user).json()
+        self.assertEqual(before['earnedPoints'], 100)
+        self.assertEqual(before['progression']['tier'], 'Novice')
+        self.assertEqual(before['progression']['level'], 2)
+
+        outcome, _unlock, remaining = unlock_hint(
+            user, self._hint(self.web_one, cost=60)
+        )
+        self.assertEqual(outcome, UNLOCK_STATUS_UNLOCKED)
+        self.assertEqual(remaining, 40)
+        user.refresh_from_db()
+
+        after = self._get(user).json()
+        # Balance dropped, but progression is unchanged (no demotion on spend).
+        self.assertEqual(after['points'], 40)
+        self.assertEqual(after['spentOnHints'], 60)
+        self.assertEqual(after['earnedPoints'], 100)
+        self.assertEqual(after['progression'], before['progression'])
+
+    def test_progression_matches_the_authoritative_earned_total(self):
+        user = self._player('solo', [self.web_one, self.web_two, self.crypto_one])
+        body = self._get(user).json()   # 100 + 50 + 80 = 230
+        self.assertEqual(body['earnedPoints'], 230)
+        self.assertEqual(body['progression'], progression_for(230))
+        self.assertEqual(body['progression']['tier'], 'Novice')
+        self.assertEqual(body['progression']['toNext'], 20)
+
+
+@override_settings(
+    PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher']
+)
+class AdminAnalyticsApiTests(TestCase):
+    """GET /api/v1/admin/analytics/ - real aggregates plus the permission gate.
+
+    Every number asserted below is derived from rows this test case writes. The
+    denormalised ``Challenge.solves`` counter is seeded with a nonsense value on
+    purpose so any read of it fails the assertions immediately.
+    """
+
+    URL = '/api/v1/admin/analytics/'
+    PASSWORD = 'pass12345'
+
+    def setUp(self):
+        cache.clear()
+        # The real group/permission configuration (idempotent), as elsewhere.
+        call_command('setup_groups', stdout=StringIO(), no_color=True)
+
+        self.category = Category.objects.create(name='Web Exploitation', order=1)
+        self.challenge = Challenge.objects.create(
+            title='Analytics Target',
+            category=self.category,
+            difficulty=Challenge.DIFFICULTY_EASY,
+            points=100,
+            status=Challenge.STATUS_PUBLISHED,
+            solves=4242,
+        )
+        self.draft = Challenge.objects.create(
+            title='Analytics Draft',
+            category=self.category,
+            difficulty=Challenge.DIFFICULTY_HARD,
+            points=50,
+            status=Challenge.STATUS_DRAFT,
+            solves=7777,
+        )
+
+        self.admin = self._user('analytics_admin', role=User.ROLE_ADMIN)
+        self.admin.groups.add(Group.objects.get(name='Admin'))
+        self.plain = self._user('analytics_plain')
+
+        self.client = APIClient()
+
+    # ── Fixture helpers ──────────────────────────────────────────────
+
+    def _user(self, username, **extra):
+        extra.setdefault('role', User.ROLE_USER)
+        return User.objects.create_user(
+            username, f'{username}@example.com', self.PASSWORD,
+            onboardingCompleted=True, **extra,
+        )
+
+    def _solve(self, user, challenge):
+        """Exactly the two rows a successful submission writes."""
+        Submission.objects.create(user=user, challenge=challenge, correct=True)
+        return Solve.objects.create(
+            user=user, challenge=challenge, points=challenge.points,
+        )
+
+    def _miss(self, user, challenge):
+        return Submission.objects.create(
+            user=user, challenge=challenge, correct=False,
+        )
+
+    def _get(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get(self.URL)
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _row(self, body, challenge):
+        return next(
+            row for row in body['per_challenge'] if row['id'] == challenge.id
+        )
+
+    # ── Authorization ────────────────────────────────────────────────
+
+    def test_anonymous_request_is_rejected(self):
+        self.assertIn(self.client.get(self.URL).status_code, (401, 403))
+
+    def test_private_players_remain_visible_to_admin_analytics(self):
+        # Profile visibility is a *player-facing* control; the administrative
+        # aggregate must still include every account.
+        self.plain.profile_visibility = User.VISIBILITY_PRIVATE
+        self.plain.save(update_fields=['profile_visibility'])
+        body = self._get()
+        usernames = {row['username'] for row in body['leaderboard']}
+        self.assertIn('analytics_plain', usernames)
+
+    def test_ordinary_user_is_forbidden(self):
+        self.client.force_authenticate(user=self.plain)
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+    def test_role_admin_without_permissions_is_forbidden(self):
+        # Holding the frontend `role='admin'` value must grant nothing.
+        impostor = self._user('analytics_impostor', role=User.ROLE_ADMIN)
+        self.client.force_authenticate(user=impostor)
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+    def test_challenge_view_permission_alone_is_not_enough(self):
+        # A Challenge Creator holds `challenges.view_challenge` but not
+        # `users.view_user`, so the cross-cutting analytics stay closed.
+        creator = self._user('analytics_creator')
+        creator.user_permissions.add(Permission.objects.get(
+            content_type__app_label='challenges', codename='view_challenge',
+        ))
+        self.client.force_authenticate(user=creator)
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+    def test_admin_group_member_can_read(self):
+        body = self._get()
+        for key in (
+            'totals', 'solve_series', 'per_challenge', 'top_solvers',
+            'recent_activity', 'leaderboard',
+        ):
+            self.assertIn(key, body)
+
+    def test_superuser_can_read(self):
+        superuser = User.objects.create_superuser(
+            'analytics_root', 'root@example.com', self.PASSWORD,
+        )
+        self.client.force_authenticate(user=superuser)
+        self.assertEqual(self.client.get(self.URL).status_code, 200)
+
+    # ── Authoritative sources ────────────────────────────────────────
+
+    def test_metrics_ignore_the_seeded_challenge_counter(self):
+        body = self._get()
+        self.assertEqual(body['totals']['solves'], 0)
+        row = self._row(body, self.challenge)
+        self.assertEqual(row['solve_count'], 0)
+        self.assertEqual(row['attempts'], 0)
+        self.assertIsNone(row['success_rate'])
+        self.assertIsNone(row['first_blood'])
+        # The seeded counters are read-only here: still exactly as seeded.
+        self.challenge.refresh_from_db()
+        self.draft.refresh_from_db()
+        self.assertEqual(self.challenge.solves, 4242)
+        self.assertEqual(self.draft.solves, 7777)
+
+    def test_aggregates_come_from_solve_and_submission_rows(self):
+        alice = self._user('alice', points=300)
+        bob = self._user('bob', points=100)
+        self._solve(alice, self.challenge)
+        self._miss(alice, self.challenge)
+        self._solve(bob, self.challenge)
+
+        body = self._get()
+
+        self.assertEqual(body['totals']['solves'], 2)
+        self.assertEqual(body['totals']['attempts'], 3)
+        self.assertEqual(body['totals']['correct_submissions'], 2)
+        self.assertEqual(body['totals']['success_rate'], 67)  # 2 of 3
+        self.assertEqual(body['totals']['unique_solvers'], 2)
+
+        row = self._row(body, self.challenge)
+        self.assertEqual(row['solve_count'], 2)
+        self.assertEqual(row['attempts'], 3)
+        self.assertEqual(row['correct'], 2)
+        self.assertEqual(row['success_rate'], 67)
+        self.assertEqual(row['category'], 'Web Exploitation')
+        self.assertEqual(row['difficulty'], Challenge.DIFFICULTY_EASY)
+        self.assertEqual(row['first_blood']['username'], 'alice')
+
+    def test_draft_challenges_are_reported_with_zero_activity(self):
+        body = self._get()
+        row = self._row(body, self.draft)
+        self.assertEqual(row['title'], 'Analytics Draft')
+        self.assertEqual(row['solve_count'], 0)
+        self.assertEqual(row['attempts'], 0)
+        self.assertEqual(row['correct'], 0)
+        self.assertIsNone(row['success_rate'])
+        self.assertIsNone(row['first_blood'])
+
+    def test_top_solvers_and_leaderboard_report_real_solve_counts(self):
+        alice = self._user('alice', points=300)
+        bob = self._user('bob', points=100)
+        self._solve(alice, self.challenge)
+        self._solve(bob, self.challenge)
+
+        body = self._get()
+
+        self.assertEqual(
+            [entry['username'] for entry in body['top_solvers']],
+            ['alice', 'bob'],
+        )
+        self.assertEqual(
+            [entry['solves'] for entry in body['top_solvers']], [1, 1],
+        )
+        self.assertEqual(body['top_solvers'][0]['rank'], 1)
+
+        alice_row = next(
+            row for row in body['leaderboard'] if row['username'] == 'alice'
+        )
+        self.assertEqual(alice_row['solves'], 1)
+        self.assertEqual(alice_row['points'], 300)
+        self.assertEqual(alice_row['email'], 'alice@example.com')
+        self.assertEqual(alice_row['status'], 'active')
+        self.assertEqual(alice_row['role'], User.ROLE_USER)
+
+    def test_recent_activity_lists_newest_attempts_including_misses(self):
+        alice = self._user('alice')
+        bob = self._user('bob')
+        self._solve(alice, self.challenge)
+        self._miss(alice, self.challenge)
+        self._solve(bob, self.challenge)
+
+        body = self._get()
+
+        self.assertEqual(len(body['recent_activity']), 3)
+        self.assertEqual(body['recent_activity'][0]['username'], 'bob')
+        self.assertTrue(body['recent_activity'][0]['correct'])
+        self.assertEqual(
+            body['recent_activity'][0]['challenge_title'], 'Analytics Target',
+        )
+        self.assertFalse(body['recent_activity'][1]['correct'])
+        self.assertEqual(body['recent_activity'][1]['username'], 'alice')
+
+    def test_soft_deleted_users_are_excluded_everywhere(self):
+        ghost = self._user('ghost', points=500)
+        keeper = self._user('keeper', points=50)
+        self._solve(ghost, self.challenge)   # earliest -> would be first blood
+        self._solve(keeper, self.challenge)
+        ghost.delete()                        # soft delete
+
+        body = self._get()
+
+        self.assertEqual(body['totals']['solves'], 1)
+        self.assertEqual(body['totals']['unique_solvers'], 1)
+        self.assertNotIn(
+            'ghost', [row['username'] for row in body['leaderboard']],
+        )
+        self.assertEqual(self._row(body, self.challenge)['solve_count'], 1)
+        self.assertEqual(
+            self._row(body, self.challenge)['first_blood']['username'],
+            'keeper',
+        )
+
+    # ── Time series ──────────────────────────────────────────────────
+
+    def test_solve_series_is_fourteen_consecutive_zero_filled_days(self):
+        body = self._get()
+        series = body['solve_series']
+
+        self.assertEqual(len(series), 14)
+        self.assertEqual(sum(entry['count'] for entry in series), 0)
+        self.assertEqual(series[-1]['date'], timezone.localdate().isoformat())
+        self.assertTrue(
+            all(
+                series[index]['date'] < series[index + 1]['date']
+                for index in range(len(series) - 1)
+            ),
+        )
+        self.assertEqual(series[-1]['count'], 0)
+
+    def test_solve_series_counts_a_solve_made_today(self):
+        self._solve(self._user('today_solvers'), self.challenge)
+
+        series = self._get()['solve_series']
+
+        self.assertEqual(series[-1]['count'], 1)
+        self.assertEqual(sum(entry['count'] for entry in series), 1)
+
+    # ── Empty datasets ───────────────────────────────────────────────
+
+    def test_no_activity_reports_zeroes_not_a_failure(self):
+        body = self._get()
+
+        self.assertEqual(
+            body['totals'],
+            {
+                'solves': 0,
+                'attempts': 0,
+                'correct_submissions': 0,
+                'success_rate': 0,
+                'unique_solvers': 0,
+            },
+        )
+        self.assertEqual(body['top_solvers'], [])
+        self.assertEqual(body['recent_activity'], [])
+        self.assertTrue(
+            all(entry['count'] == 0 for entry in body['solve_series'])
+        )
+
+    def test_unfiltered_read_does_not_modify_any_row(self):
+        self._solve(self._user('alice'), self.challenge)
+        snapshot = (
+            Solve.objects.count(),
+            Submission.objects.count(),
+            User.all_objects.count(),
+            Challenge.objects.get(pk=self.challenge.pk).solves,
+        )
+
+        self._get()
+
+        self.assertEqual(
+            snapshot,
+            (
+                Solve.objects.count(),
+                Submission.objects.count(),
+                User.all_objects.count(),
+                Challenge.objects.get(pk=self.challenge.pk).solves,
+            ),
+        )

@@ -26,7 +26,19 @@ urlpatterns = [
     path('api/v1/', include('challenges.urls')),
     # Flag submission: POST /api/v1/challenges/{id}/submit/.
     path('api/v1/', include('submissions.urls')),
+    # In-app notifications: /api/v1/notifications/.
+    path('api/v1/notifications/', include('notifications.urls')),
+    # Public announcements: /api/v1/announcements/ (active published only).
+    path('api/v1/', include('announcements.urls')),
+    # Player achievement board: /api/v1/achievements/.
+    path('api/v1/', include('achievements.urls')),
     # Admin challenge endpoints share the /api/v1/admin/ prefix with users.
     path('api/v1/admin/', include('users.admin_urls')),
     path('api/v1/admin/', include('challenges.admin_urls')),
+    # Admin announcement management: /api/v1/admin/announcements/.
+    path('api/v1/admin/', include('announcements.admin_urls')),
+    # Admin achievement management: /api/v1/admin/achievements/.
+    path('api/v1/admin/', include('achievements.admin_urls')),
+    # Admin dashboard/analytics aggregates: /api/v1/admin/analytics/.
+    path('api/v1/admin/', include('submissions.admin_urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
